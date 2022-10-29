@@ -1,27 +1,40 @@
 package handler
 
 import (
-	"encoding/json"
-	"errors"
+	"io/ioutil"
+	"log"
 	"net/http"
 
-	"github.com/ezzycreative1/svc-url-shortener/app/v1/handler/request"
-	urlPort "github.com/ezzycreative1/svc-url-shortener/business/shortener/ports"
 	"github.com/ezzycreative1/svc-url-shortener/config"
+	"github.com/ezzycreative1/svc-url-shortener/internal/core/ports"
 	"github.com/ezzycreative1/svc-url-shortener/pkg/mid"
 	"github.com/ezzycreative1/svc-url-shortener/pkg/mlog"
 	"github.com/ezzycreative1/svc-url-shortener/pkg/mvalidator"
+	js "github.com/ezzycreative1/svc-url-shortener/serializer/json"
+	ms "github.com/ezzycreative1/svc-url-shortener/serializer/msgpack"
+
+	//shortener "github.com/ezzycreative1/svc-url-shortener/shortener"
+	"github.com/pkg/errors"
 )
 
+func makeResponse(w http.ResponseWriter, contentType string, body []byte, statusCode int) {
+	w.Header().Set("Content-Type", contentType)
+	w.WriteHeader(statusCode)
+	_, err := w.Write(body)
+	if err != nil {
+		log.Println(err)
+	}
+}
+
 type UrlShortHandler struct {
-	UseCase   *urlPort.IUrlShortenerUsecase
+	UseCase   ports.IShortenerUsecase
 	Validator mvalidator.Validator
 	Logger    mlog.Logger
 	Cfg       config.Group
 }
 
 func NewCogsHandler(
-	usecase *urlPort.IUrlShortenerUsecase,
+	usecase ports.IShortenerUsecase,
 	validator mvalidator.Validator,
 	logger mlog.Logger,
 	config config.Group,
@@ -34,31 +47,43 @@ func NewCogsHandler(
 	}
 }
 
-func (us *UrlShortHandler) Create(w http.ResponseWriter, r *http.Request) error {
+func (us *UrlShortHandler) serializer(contentType string) shortener.RedirectSerializer {
+	if contentType == "application/x-msgpack" {
+		return &ms.Redirect{}
+	}
+	return &js.Redirect{}
+}
 
+func (us *UrlShortHandler) Create(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	requestID := mid.GetID(ctx)
-	usecaseContext := mid.SetIDx(ctx, requestID)
+	userContext := mid.SetIDx(ctx, requestID)
 
-	if r.ContentLength == 0 {
-		return errors.New("empty body")
-	}
-
-	//var plan *model.Plan
-	req := request.UrlShortReq{
-		Url: r.PostFormValue("url"),
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		us.Logger.ErrorT(requestID, "create url shortener payload", err, mlog.Any("payload", req))
-		return err
-	}
-
-	data, err := us.UseCase.CreateShortUrl(usecaseContext, req)
+	contentType := r.Header.Get("Content-Type")
+	requestBody, err := ioutil.ReadAll(r.Body)
 	if err != nil {
-		return err
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		return
+	}
+	redirect, err := us.serializer(contentType).Decode(requestBody)
+	if err != nil {
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		return
 	}
 
-	w.WriteHeader(http.StatusCreated)
-	return json.NewEncoder(w).Encode(data)
+	err = us.UseCase.Store(userContext, redirect)
+	if err != nil {
+		if errors.Cause(err) == shortener.ErrRedirectInvalid {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		return
+	}
+	responseBody, err := us.serializer(contentType).Encode(redirect)
+	if err != nil {
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		return
+	}
+	makeResponse(w, contentType, responseBody, http.StatusCreated)
 }
